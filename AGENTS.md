@@ -70,7 +70,7 @@ npm, with a committed `package-lock.json`. Only the scripts that actually exist 
 
 ```bash
 npm ci                      # install (lockfile-exact)
-npm test                    # vitest run -- the full suite
+npm test                    # vitest run -- everything under __tests__/ (and nothing else; see below)
 npm run test:watch          # vitest (watch)
 npm run test:coverage       # vitest run --coverage
 npm run test:oauth-provider # node --import tsx --test mcp-oauth-provider.test.ts (single file, node:test)
@@ -102,9 +102,11 @@ Every feature here is judged by what it costs the model's context. Before adding
 
 This is a fork that intends to stay mergeable. Match the existing module boundaries, naming, and test layout (`__tests__/<module>.test.ts`). Prefer a change a maintainer would recognize as belonging in their codebase over one tailored to a private setup.
 
-### Tests live in `__tests__/`, under vitest
+### Tests live in `__tests__/`, or they do not run
 
-New behavior gets a test in `__tests__/`, named after the module it covers. Note the two `*.test.ts` files at the repo root (`mcp-auth*.test.ts`, `mcp-oauth-provider.test.ts`) are upstream's; follow `__tests__/` for new work.
+New behavior gets a test in `__tests__/`, named after the module it covers.
+
+This is not a style preference. `vitest.config.ts` sets `include: ["__tests__/**/*.test.ts"]`, so **vitest collects nothing outside `__tests__/`**. Four `*.test.ts` files sit at the repository root (`mcp-auth.test.ts`, `mcp-auth-flow.test.ts`, `mcp-callback-server.test.ts`, `mcp-oauth-provider.test.ts`) and `npm test` runs **none** of them — only `mcp-oauth-provider.test.ts` is reachable, through `npm run test:oauth-provider` (node's built-in test runner, not vitest). Put a new test at the root and you will watch it pass by never running.
 
 ## What NOT to Do
 
@@ -113,6 +115,7 @@ New behavior gets a test in `__tests__/`, named after the module it covers. Note
 - **Don't invent npm scripts.** There is no `npm run build`, no `npm run lint`, no `npm run typecheck`. Use the commands above.
 - **Don't bypass the output guard** to "just return the raw result" — that is the bug the guard exists to prevent.
 - **Don't publish to npm.** The package name `pi-mcp-adapter` on npm is upstream's.
+- **Don't commit the orchestrator block appended to this file.** A Codex-runtime session appends its system prompt below a `<!-- BEGIN Zimmer context (managed by Zimmer) -->` marker in the working directory's `AGENTS.md` — i.e. *this* tracked file (and `CLAUDE.md`, which symlinks to it). It leaves the file dirty. `git add -A` would sweep it into a PR. Stage deliberately, and if that marker shows up in `git diff`, revert it.
 
 ## FAQ / Learnings
 
