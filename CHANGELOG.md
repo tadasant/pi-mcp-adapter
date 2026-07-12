@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added an estimated-token budget to the MCP output guard: inline tool/resource text is now capped at ~10,000 estimated tokens (characters / 4) in addition to the existing byte and line caps — whichever limit trips first governs. Tune with `settings.outputGuard.maxTokens` or the `MCP_OUTPUT_MAX_TOKENS` env var; set either to `0` to disable the token cap.
+
+### Changed
+- Spilled MCP output now lands in a durable, predictable directory (`<Pi agent dir>/mcp-output/`, honoring `PI_CODING_AGENT_DIR`) instead of an ephemeral `mkdtemp` directory, and the oldest files are pruned once the directory exceeds 200 entries. The truncation notice returned to the model now includes a character/token/line summary, the saved path, and guidance to read it with offset/limit, grep it, or query it — rather than pulling the blob back inline.
+
 ## [2.11.0] - 2026-07-03
 
 ### Changed

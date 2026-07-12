@@ -196,7 +196,7 @@ You can also pass only the `code` query parameter with `args: '{"code":"..."}'`.
 | `sampling` | Allow MCP servers to sample through Pi models, honoring `modelPreferences.hints` before current/default fallback (default: true when UI approval is available). |
 | `samplingAutoApprove` | Skip sampling confirmation prompts. Required for sampling in non-UI sessions (default: false). |
 | `elicitation` | Allow MCP servers to request user input through Pi dialogs (default: true when Pi UI is available). |
-| `outputGuard` | Guard oversized MCP output: `true` (default), `false`, or `{ maxBytes, maxLines, detailsMaxBytes }`. See [Output Guard](#output-guard). |
+| `outputGuard` | Guard oversized MCP output: `true` (default), `false`, or `{ maxBytes, maxLines, maxTokens, detailsMaxBytes }`. See [Output Guard](#output-guard). |
 
 Per-server `idleTimeout` and `requestTimeoutMs` override the global settings.
 
@@ -204,21 +204,34 @@ Per-server `idleTimeout` and `requestTimeoutMs` override the global settings.
 
 Oversized MCP tool/resource results are guarded by default so a single huge response can't blow up the model context window or the session file:
 
-- Inline text output is capped at **50 KiB / 2,000 lines** (matching Pi's built-in `bash` guard). Larger output is truncated to a head preview and the full text is saved to a temp file whose path is included in the result, so the agent can `read`/`grep` it.
+- Inline text output is capped by three limits that compose — **whichever trips first governs**:
+  - **~10,000 estimated tokens** (characters / 4). This is the context-window budget: roughly 5% of a 200k-token window, so no single tool call can crowd out the conversation.
+  - **50 KiB** of UTF-8 bytes.
+  - **2,000 lines** (matching Pi's built-in `bash` guard).
+- Larger output is truncated to a head preview, and the full text is saved to `<Pi agent dir>/mcp-output/` (`~/.pi/agent/mcp-output/` by default, or `$PI_CODING_AGENT_DIR/mcp-output/`). The model gets a size summary (characters / estimated tokens / lines) plus the saved path, so it can `read` the file with `offset`/`limit`, `grep` it, or run a structured query over it instead of pulling the blob back inline.
 - **Image content blocks pass through unchanged** — only text output is guarded. Images are delivered to the provider as native image content.
-- In proxy mode, `details.mcpResult` is kept raw when its JSON is **≤ 16 KiB**; larger results are replaced with a compact summary (block counts, sizes, key previews) and the raw JSON is saved to a temp file. Direct tools keep their lean details and never carry `mcpResult`.
+- In proxy mode, `details.mcpResult` is kept raw when its JSON is **≤ 16 KiB**; larger results are replaced with a compact summary (block counts, sizes, key previews) and the raw JSON is saved alongside the spilled text. Direct tools keep their lean details and never carry `mcpResult`.
 
 Tune the limits with the object form:
 
 ```json
 {
   "settings": {
-    "outputGuard": { "maxBytes": 51200, "maxLines": 2000, "detailsMaxBytes": 16384 }
+    "outputGuard": { "maxBytes": 51200, "maxLines": 2000, "maxTokens": 10000, "detailsMaxBytes": 16384 }
   }
 }
 ```
 
-Set `"outputGuard": false` — or the env kill switch `MCP_OUTPUT_GUARD=0` — to disable the guard and restore raw output behavior. Saved temp files are created with mode `0600` under the system temp directory and are not cleaned up automatically; note that spilled MCP output may contain sensitive data.
+The token cap can also be set from the environment, which is handy for one-off runs:
+
+```bash
+MCP_OUTPUT_MAX_TOKENS=2000 pi     # tighter budget for this session
+MCP_OUTPUT_MAX_TOKENS=0 pi        # token cap off; byte and line caps still apply
+```
+
+Precedence for the token cap is **`settings.outputGuard.maxTokens` → `MCP_OUTPUT_MAX_TOKENS` → the 10,000 default**. `0` disables it in either place.
+
+Set `"outputGuard": false` — or the env kill switch `MCP_OUTPUT_GUARD=0` — to disable the guard entirely and restore raw output behavior. Spill files are created with mode `0600` in a `0700` directory; the 200 most recent are kept and older ones are pruned. Note that spilled MCP output may contain sensitive data. If the agent dir cannot be written, the adapter falls back to a temp file, and if that also fails it returns the head preview inline with the write error rather than dropping the result.
 
 ### MCP Elicitation
 

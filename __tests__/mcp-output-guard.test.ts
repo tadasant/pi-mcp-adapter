@@ -61,8 +61,8 @@ describe("guardMcpOutput", () => {
     expect(guarded.content).toHaveLength(1);
     expect(guarded.content[0]).toMatchObject({ type: "text" });
     const returnedText = guarded.content[0].type === "text" ? guarded.content[0].text : "";
-    expect(returnedText).toContain("MCP text output truncated");
-    expect(returnedText).toContain("Full text saved to:");
+    expect(returnedText).toContain("MCP output truncated");
+    expect(returnedText).toContain("Full output saved to:");
     expect(returnedText).not.toContain("line-19");
 
     const saved = await readFile(guarded.outputGuard!.fullOutputPath!, "utf8");
@@ -166,6 +166,7 @@ describe("resolveMcpOutputGuardOptions", () => {
       enabled: true,
       maxBytes: 50 * 1024,
       maxLines: 2000,
+      maxTokens: 10_000,
       detailsMaxBytes: 16 * 1024,
     });
   });

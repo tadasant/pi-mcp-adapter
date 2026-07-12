@@ -324,6 +324,13 @@ export interface McpOutputGuardSettings {
   maxBytes?: number;
   /** Maximum inline MCP text output lines before truncation/spill-to-disk. Defaults to 2000. */
   maxLines?: number;
+  /**
+   * Maximum estimated tokens (characters / 4) of inline MCP text output before
+   * truncation/spill-to-disk. Composes with maxBytes/maxLines — whichever limit
+   * trips first governs. Defaults to 10000; set to 0 to disable the token cap.
+   * Env override (used only when this is unset): MCP_OUTPUT_MAX_TOKENS.
+   */
+  maxTokens?: number;
   /** Maximum details.mcpResult JSON bytes kept raw; larger results are summarized and spilled to disk. Defaults to 16384 (16 KiB). */
   detailsMaxBytes?: number;
 }
@@ -341,9 +348,10 @@ export interface McpSettings {
   elicitation?: boolean;
   /**
    * Guard oversized MCP tool/resource output before it is returned to the model.
-   * Defaults to true (50 KiB / 2,000 lines inline text, 16 KiB details.mcpResult).
-   * Set to false to restore raw MCP output behavior, or pass an object to tune
-   * the limits. Env kill switch: MCP_OUTPUT_GUARD=0.
+   * Defaults to true (50 KiB / 2,000 lines / ~10,000 estimated tokens of inline
+   * text, 16 KiB details.mcpResult). Set to false to restore raw MCP output
+   * behavior, or pass an object to tune the limits. Env kill switch:
+   * MCP_OUTPUT_GUARD=0.
    */
   outputGuard?: boolean | McpOutputGuardSettings;
   /**
