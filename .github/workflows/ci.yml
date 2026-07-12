@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # __tests__/interactive-visualizer-server.test.ts asserts against the example's
+      # build artifacts, which are not committed. The example has no committed
+      # lockfile, so this is `npm install` (not `npm ci`) with lockfile writing off.
+      - name: Build interactive-visualizer example
+        working-directory: examples/interactive-visualizer
+        run: |
+          npm install --no-package-lock --no-audit --no-fund
+          npm run build
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npm test
