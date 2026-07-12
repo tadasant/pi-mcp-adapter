@@ -231,7 +231,13 @@ MCP_OUTPUT_MAX_TOKENS=0 pi        # token cap off; byte and line caps still appl
 
 Precedence for the token cap is **`settings.outputGuard.maxTokens` → `MCP_OUTPUT_MAX_TOKENS` → the 10,000 default**. `0` disables it in either place.
 
-Set `"outputGuard": false` — or the env kill switch `MCP_OUTPUT_GUARD=0` — to disable the guard entirely and restore raw output behavior. Spill files are created with mode `0600` in a `0700` directory; the 200 most recent are kept and older ones are pruned. Note that spilled MCP output may contain sensitive data. If the agent dir cannot be written, the adapter falls back to a temp file, and if that also fails it returns the head preview inline with the write error rather than dropping the result.
+Set `"outputGuard": false` — or the env kill switch `MCP_OUTPUT_GUARD=0` — to disable the guard entirely and restore raw output behavior.
+
+A few details worth knowing:
+
+- The pointer notice is the floor of what a truncated result costs: a cap too small to fit the full notice gets a one-line pointer instead of a preview, but the guard can never spend zero tokens telling the model where the payload went.
+- Spill files are created with mode `0600` in a `0700` directory. The directory is trimmed to its 200 most recent files and 128 MiB; the file a result just pointed at is never pruned. Spilled MCP output may contain sensitive data.
+- If the agent dir cannot be written, the adapter falls back to a temp file; if that also fails, it returns the head preview inline along with the write error rather than dropping the result.
 
 ### MCP Elicitation
 

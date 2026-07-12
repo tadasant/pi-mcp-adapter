@@ -21,6 +21,8 @@ export const CHARS_PER_TOKEN = 4;
 export const MCP_SPILL_DIR = "mcp-output";
 /** Spill files retained in the (durable) spill directory before the oldest are pruned. */
 export const DEFAULT_MAX_SPILL_FILES = 200;
+/** Total bytes retained in the spill directory before the oldest files are pruned. */
+export const DEFAULT_MAX_SPILL_BYTES = 128 * 1024 * 1024;
 
 const CONTENT_SUMMARY_LIMIT = 20;
 const KEY_PREVIEW_LIMIT = 20;
@@ -172,7 +174,8 @@ export async function guardMcpOutput(
 
   if (exceeded.length > 0) {
     const { path: fullOutputPath, error: writeError } = await saveArtifact("output", composedOutput, maxSpillFiles);
-    const notice = formatTruncationNotice(stats, exceeded, { maxBytes, maxLines, maxTokens }, fullOutputPath, writeError);
+    const limits = { maxBytes, maxLines, maxTokens };
+    const notice = chooseTruncationNotice(stats, exceeded, limits, fullOutputPath, writeError);
     const previewBudget = reserveBudget(maxBytes, maxLines, maxTokens, notice);
     const preview = truncateHead(composedOutput, previewBudget);
     const finalText = `${preview}\n\n${notice}`;
@@ -272,7 +275,9 @@ interface PreviewBudget {
 
 /**
  * Budget for the head preview: the configured limits minus what the truncation
- * notice itself costs, so preview + notice stays inside every limit.
+ * notice itself costs, so preview + notice stays inside every limit. A limit
+ * smaller than the notice leaves no preview budget at all — the notice alone is
+ * then returned, and it is the floor of what the guard can spend.
  */
 function reserveBudget(maxBytes: number, maxLines: number, maxTokens: number, notice: string): PreviewBudget {
   const noticeStats = textStats(`\n\n${notice}`);
@@ -329,10 +334,37 @@ function truncateString(value: string, maxBytes: number, maxChars: number): stri
   return value.slice(0, end);
 }
 
+type Limits = { maxBytes: number; maxLines: number; maxTokens: number };
+
+/**
+ * The notice is the floor of what the guard returns: it cannot point the model at
+ * the spilled payload without spending some tokens. When a cap is small enough that
+ * the full notice alone would blow it, fall back to a one-line pointer so the cost
+ * of the notice stays proportional to the budget.
+ */
+function chooseTruncationNotice(
+  stats: TextStats,
+  exceeded: ExceededLimit[],
+  limits: Limits,
+  fullOutputPath: string | undefined,
+  writeError: string | undefined,
+): string {
+  const notice = formatTruncationNotice(stats, exceeded, limits, fullOutputPath, writeError);
+  if (fitsWithin(notice, limits)) return notice;
+  return formatCompactTruncationNotice(stats, fullOutputPath, writeError);
+}
+
+function fitsWithin(text: string, limits: Limits): boolean {
+  const stats = textStats(text);
+  return stats.bytes <= limits.maxBytes
+    && stats.lines <= limits.maxLines
+    && (limits.maxTokens <= 0 || stats.tokens <= limits.maxTokens);
+}
+
 function formatTruncationNotice(
   stats: TextStats,
   exceeded: ExceededLimit[],
-  limits: { maxBytes: number; maxLines: number; maxTokens: number },
+  limits: Limits,
   fullOutputPath: string | undefined,
   writeError: string | undefined,
 ): string {
@@ -347,6 +379,18 @@ function formatTruncationNotice(
   return `${head}
 Full output saved to: ${fullOutputPath}
 Work through the file instead of pulling it back inline: read it with offset/limit, grep it for what you need, or run a structured query (jq, rg) over it.]`;
+}
+
+function formatCompactTruncationNotice(
+  stats: TextStats,
+  fullOutputPath: string | undefined,
+  writeError: string | undefined,
+): string {
+  const size = `${stats.chars.toLocaleString()} chars / ~${stats.tokens.toLocaleString()} est. tokens`;
+  if (!fullOutputPath) {
+    return `[MCP output truncated: ${size}. Not saved (${writeError ?? "unknown error"}).]`;
+  }
+  return `[MCP output truncated: ${size}. Read/grep with offset/limit: ${fullOutputPath}]`;
 }
 
 function describeLimit(limit: ExceededLimit, limits: { maxBytes: number; maxLines: number; maxTokens: number }): string {
@@ -465,7 +509,7 @@ async function saveArtifact(kind: string, text: string, maxSpillFiles: number): 
     const path = resolveWithin(durableDir, name);
     // "wx" fails rather than following a pre-existing file or symlink at that path.
     await writeFile(path, text, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    await pruneSpillDir(durableDir, maxSpillFiles);
+    await pruneSpillDir(durableDir, maxSpillFiles, path);
     return { path };
   } catch (durableError) {
     try {
@@ -496,41 +540,62 @@ function resolveWithin(dir: string, name: string): string {
   return path;
 }
 
+interface SpillFile {
+  path: string;
+  mtimeMs: number;
+  bytes: number;
+}
+
 /**
- * Keep the durable spill directory bounded: a long-lived agent dir would
- * otherwise accumulate spill files forever. Best-effort — a prune failure must
- * not fail the tool call whose output we just saved.
+ * Keep the durable spill directory bounded — a long-lived agent dir would otherwise
+ * accumulate spill files forever — by evicting the oldest files once the directory
+ * exceeds either budget. `keepPath` is the file we just wrote and pointed the model
+ * at; it is never evicted, even if it alone busts the byte budget. Best-effort: a
+ * prune failure must not fail the tool call whose output we just saved.
  */
-async function pruneSpillDir(dir: string, maxSpillFiles: number): Promise<void> {
-  if (!(maxSpillFiles > 0)) return;
+async function pruneSpillDir(dir: string, maxSpillFiles: number, keepPath: string): Promise<void> {
   try {
     const names = await readdir(dir);
-    if (names.length <= maxSpillFiles) return;
 
     const entries = await Promise.all(names.map(async (name) => {
       const path = join(dir, name);
       try {
         const info = await stat(path);
-        return info.isFile() ? { path, mtimeMs: info.mtimeMs } : undefined;
+        return info.isFile() ? { path, mtimeMs: info.mtimeMs, bytes: info.size } : undefined;
       } catch {
-        return undefined; // Raced with another prune; nothing to do.
+        return undefined; // Raced with a concurrent prune; nothing to do.
       }
     }));
 
-    const files = entries.filter((entry): entry is { path: string; mtimeMs: number } => entry !== undefined)
+    // Oldest first: those are the ones a long session no longer needs.
+    const files = entries.filter((entry): entry is SpillFile => entry !== undefined && entry.path !== keepPath)
       .sort((a, b) => a.mtimeMs - b.mtimeMs);
 
-    for (const file of files.slice(0, Math.max(0, files.length - maxSpillFiles))) {
-      try {
-        await unlink(file.path);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
-          logger.debug("Failed to prune MCP output spill file", { path: file.path, error: errorMessage(error) });
-        }
-      }
+    // The file we just wrote occupies one slot of the budget and is never evicted.
+    const fileBudget = maxSpillFiles > 0 ? Math.max(0, maxSpillFiles - 1) : Number.POSITIVE_INFINITY;
+    let count = files.length;
+    let bytes = files.reduce((total, file) => total + file.bytes, 0);
+
+    for (const file of files) {
+      if (count <= fileBudget && bytes <= DEFAULT_MAX_SPILL_BYTES) break;
+      if (!(await removeSpillFile(file.path))) continue;
+      count -= 1;
+      bytes -= file.bytes;
     }
   } catch (error) {
     logger.debug("Failed to prune MCP output spill directory", { path: dir, error: errorMessage(error) });
+  }
+}
+
+/** Returns true when the file is gone (deleted here, or already deleted by a concurrent prune). */
+async function removeSpillFile(path: string): Promise<boolean> {
+  try {
+    await unlink(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return true;
+    logger.debug("Failed to prune MCP output spill file", { path, error: errorMessage(error) });
+    return false;
   }
 }
 

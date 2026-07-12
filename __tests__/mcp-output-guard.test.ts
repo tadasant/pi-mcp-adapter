@@ -1,6 +1,21 @@
+import { mkdtempSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { guardMcpOutput, resolveMcpOutputGuardOptions, type McpResultSummary } from "../mcp-output-guard.ts";
+
+// Spilled output lands under the Pi agent dir; keep the suite out of the real one.
+const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+
+beforeEach(() => {
+  process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-mcp-guard-agent-"));
+});
+
+afterEach(() => {
+  if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+});
 
 describe("guardMcpOutput", () => {
   it("leaves small MCP output unchanged and keeps the raw result in details", async () => {
@@ -62,7 +77,9 @@ describe("guardMcpOutput", () => {
     expect(guarded.content[0]).toMatchObject({ type: "text" });
     const returnedText = guarded.content[0].type === "text" ? guarded.content[0].text : "";
     expect(returnedText).toContain("MCP output truncated");
-    expect(returnedText).toContain("Full output saved to:");
+    // A 300-byte cap cannot afford the full notice, so the guard points at the spill
+    // file with its one-line pointer instead.
+    expect(returnedText).toContain(guarded.outputGuard!.fullOutputPath!);
     expect(returnedText).not.toContain("line-19");
 
     const saved = await readFile(guarded.outputGuard!.fullOutputPath!, "utf8");

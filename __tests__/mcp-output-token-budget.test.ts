@@ -154,7 +154,7 @@ describe("token budget enforcement", () => {
     expect(await readFile(guarded.outputGuard!.fullOutputPath!, "utf8")).toBe(text);
   });
 
-  it("returns just the pointer when the cap is too small to fit a preview alongside it", async () => {
+  it("falls back to a one-line pointer when the cap is too small for the full notice", async () => {
     const text = "b".repeat(100_000);
     const guarded = await guardMcpOutput([{ type: "text", text }], {
       maxBytes: 10_000_000,
@@ -165,11 +165,23 @@ describe("token budget enforcement", () => {
     const returned = textOf(guarded);
     expect(returned.trim().startsWith("[MCP output truncated")).toBe(true);
     expect(returned).not.toContain("bbbb");
-    // The notice is the floor: a cap below its size cannot shrink it further, but
-    // it is still ~2 orders of magnitude smaller than the payload it replaces.
-    expect(estimateTokens(returned)).toBeLessThan(200);
-    expect(estimateTokens(returned) * 50).toBeLessThan(estimateTokens(text));
+    expect(returned.split("\n").filter(Boolean)).toHaveLength(1);
+    expect(returned).toContain(guarded.outputGuard!.fullOutputPath!);
+    // The pointer is the floor — the guard cannot name the spill file for free — but
+    // it stays orders of magnitude below the payload it replaces.
+    expect(estimateTokens(returned)).toBeLessThan(60);
+    expect(estimateTokens(returned) * 100).toBeLessThan(estimateTokens(text));
     expect(await readFile(guarded.outputGuard!.fullOutputPath!, "utf8")).toBe(text);
+  });
+
+  it("keeps the full notice — and a preview — once the cap can afford them", async () => {
+    const text = "b".repeat(100_000);
+    const guarded = await guardMcpOutput([{ type: "text", text }], { maxTokens: 1_000 });
+
+    const returned = textOf(guarded);
+    expect(returned).toContain("Full output saved to:");
+    expect(returned).toContain("bbbb");
+    expect(estimateTokens(returned)).toBeLessThanOrEqual(1_000);
   });
 
   it("keeps the whole guarded payload — preview plus notice — inside the token cap", async () => {
@@ -284,12 +296,18 @@ describe("durable spill location", () => {
 
   it("bounds the spill directory so a long-lived agent dir cannot grow without limit", async () => {
     const text = "g".repeat(5_000);
+    const paths: string[] = [];
     for (let i = 0; i < 6; i++) {
-      await guardMcpOutput([{ type: "text", text: `${i}\n${text}` }], { maxTokens: 50, maxSpillFiles: 3 });
+      const guarded = await guardMcpOutput([{ type: "text", text: `${i}\n${text}` }], { maxTokens: 50, maxSpillFiles: 3 });
+      paths.push(guarded.outputGuard!.fullOutputPath!);
     }
 
     const entries = await readdir(join(agentDir, "mcp-output"));
     expect(entries.length).toBeLessThanOrEqual(3);
+
+    // The pointer handed to the model for the most recent call must still resolve —
+    // pruning evicts the oldest spills, never the one just written.
+    expect(await readFile(paths[paths.length - 1], "utf8")).toContain("5\n");
   });
 });
 
