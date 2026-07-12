@@ -29,7 +29,8 @@ Tadas may propose fork changes upstream as separate PRs. Keep every change clean
 
 Three files are **fork-local infrastructure** and are deliberately not upstream:
 
-- `AGENTS.md` (and its `CLAUDE.md` symlink) — this file
+- `AGENTS.md` — this file
+- `CLAUDE.md` — a symlink to `AGENTS.md`, so Claude Code loads the same content
 - `.github/workflows/ci.yml` — upstream has no CI
 
 When cherry-picking a change upstream, branch from `upstream/main` and take only the feature commits; do not carry these files into an upstream PR.
@@ -43,7 +44,7 @@ git fetch upstream && git merge upstream/main
 
 ## Folder Hierarchy
 
-The repo is **flat TypeScript at the root** — there is no `src/`.
+The repo is **flat TypeScript at the root** — there is no `src/`. The tree below is abridged: it covers the modules you are most likely to touch, not all ~45 of them. `package.json`'s `files` array is the authoritative list of root source modules.
 
 ```
 pi-mcp-adapter/
@@ -60,7 +61,7 @@ pi-mcp-adapter/
 │                             #   call, ui-messages, auth-start, auth-complete
 ├── direct-tools.ts           # Per-tool direct registration: resolveDirectTools, buildProxyDescription,
 │                             #   createDirectToolExecutor
-├── mcp-output-guard.ts       # Bounds model-facing MCP output (see Token Efficiency below)
+├── mcp-output-guard.ts       # Bounds model-facing MCP output (see "Output guarding" under Domain Context)
 ├── tool-registrar.ts         # Transforms MCP content blocks into Pi content blocks
 ├── tool-result-renderer.ts   # TUI rendering of tool calls/results (collapsed to 3 lines)
 ├── init.ts, lifecycle.ts     # Connection bring-up; idle disconnect and keep-alive health checks
@@ -106,14 +107,16 @@ There is **no build step and no lint step.** Pi loads the `.ts` files directly, 
 
 Two scope gotchas worth internalizing:
 
-- `npx tsc --noEmit` does **not** typecheck `__tests__/` — `tsconfig.json`'s `include` is `["*.ts"]`, root-only and non-recursive. A type error in a test surfaces only when vitest runs it.
-- `npm test` runs **only** `__tests__/**/*.test.ts`. The four root-level `*.test.ts` files (`mcp-auth.test.ts`, `mcp-auth-flow.test.ts`, `mcp-callback-server.test.ts`, `mcp-oauth-provider.test.ts`) are `node:test` files outside vitest's include glob; only `mcp-oauth-provider.test.ts` is wired to a script (`npm run test:oauth-provider`).
+- **Nothing typechecks `__tests__/`.** `tsconfig.json`'s `include` is `["*.ts"]` — root-only and non-recursive — so `tsc` never sees the suite, and vitest transpiles through esbuild without typechecking. A type error in a test file is caught by neither command: `npm test` passes it happily. To typecheck a test, invoke `tsc` on it directly: `npx tsc --noEmit --allowImportingTsExtensions __tests__/foo.test.ts`.
+- `npm test` runs **only** `__tests__/**/*.test.ts`. The four root-level `*.test.ts` files (`mcp-auth.test.ts`, `mcp-auth-flow.test.ts`, `mcp-callback-server.test.ts`, `mcp-oauth-provider.test.ts`) are `node:test` files outside vitest's include glob; only `mcp-oauth-provider.test.ts` is wired to a script (`npm run test:oauth-provider`). CI does not run them.
 
 `__tests__/interactive-visualizer-server.test.ts` reads build artifacts from `examples/interactive-visualizer/dist/`. On a clean checkout those do not exist and the two tests in that file fail with `ENOENT`. Build the example once and the suite is fully green:
 
 ```bash
-cd examples/interactive-visualizer && npm install && npm run build && cd ../..
+cd examples/interactive-visualizer && npm install --no-package-lock && npm run build && cd ../..
 ```
+
+(`--no-package-lock`: the example has no committed lockfile, and a plain `npm install` leaves an untracked one behind for you to accidentally commit.)
 
 CI does this for you (`.github/workflows/ci.yml`).
 
@@ -122,7 +125,7 @@ CI does this for you (`.github/workflows/ci.yml`).
 - New tests go in `__tests__/<module>.test.ts`. Nowhere else — a root-level `*.test.ts` will never run under `npm test`.
 - Import the module under test from the parent directory with an explicit extension: `import { guardMcpOutput } from "../mcp-output-guard.ts"`.
 - `globals: true` is set, but tests still import `describe`/`it`/`expect` from `vitest` explicitly. Follow that.
-- Prefer plain unit tests over hand-built `McpConfig` / `MetadataCache` literals (see `__tests__/direct-tools.test.ts`). Reach for `vi.mock` only to stub sibling modules at a real boundary, as `__tests__/server-manager-http-auth.test.ts` does.
+- The house style is a plain unit test over hand-built `McpConfig` / `MetadataCache` literals — see `__tests__/direct-tools.test.ts`. Reach for `vi.mock` only to stub an **external** dependency at a real boundary, the way `__tests__/server-manager-http-auth.test.ts` mocks the MCP SDK's client transports. Internal modules are not mocked anywhere in this suite; don't start.
 - Fixture MCP servers live in `__tests__/fixtures/`.
 
 ## Core Principles
@@ -131,9 +134,9 @@ CI does this for you (`.github/workflows/ci.yml`).
 
 This is not a general-purpose MCP client; it is an MCP client whose reason to exist is that the model's context window is scarce. Any change that puts more bytes in front of the model — a longer tool description, an unbounded tool result, eagerly registered tools, a verbose error string — is working against the point of the package. When adding a code path that reaches the model, ask what its worst-case token cost is and bound it.
 
-### Nothing runs for you
+### Don't let CI be your first check
 
-There is no CI on upstream and no pre-commit hook. Run `npm test` and `npx tsc --noEmit` yourself before you push, every time.
+This fork has CI (`.github/workflows/ci.yml`); upstream has none, and there is no pre-commit hook anywhere. Run `npm test` and `npx tsc --noEmit` locally before you push, every time — CI is the confirmation, not the feedback loop. Remember that neither command typechecks `__tests__/` (above), so a test file's types are on you.
 
 ### Match the file you are in
 
@@ -142,7 +145,7 @@ There is no CI on upstream and no pre-commit hook. Run `npm test` and `npx tsc -
 ## What NOT to Do
 
 - **Do not open a PR against `nicobailon/pi-mcp-adapter`.** See [Fork Discipline](#fork-discipline).
-- **Do not add a new root-level source module without adding it to the `files` array in `package.json`.** `__tests__/package-manifest.test.ts` asserts that every root `*.ts` that is not a test appears there — omitting it fails the suite.
+- **Do not add a new root-level source module without adding it to the `files` array in `package.json`.** `__tests__/package-manifest.test.ts` asserts that every root `*.ts` other than tests and `vitest.config.ts` appears there — omitting it fails the suite.
 - **Do not bump `version` in `package.json` as part of a feature PR.** Version bumps are separate release commits.
 - **Do not put new tests at the repo root.** They will not run.
 - **Do not treat the two `interactive-visualizer` failures on a fresh clone as your regression.** Build the example (above) and they pass.

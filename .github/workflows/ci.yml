@@ -20,11 +20,12 @@ jobs:
         run: npm ci
 
       # __tests__/interactive-visualizer-server.test.ts asserts against the example's
-      # build artifacts, which are not committed.
+      # build artifacts, which are not committed. The example has no committed
+      # lockfile, so this is `npm install` (not `npm ci`) with lockfile writing off.
       - name: Build interactive-visualizer example
         working-directory: examples/interactive-visualizer
         run: |
-          npm install --no-audit --no-fund
+          npm install --no-package-lock --no-audit --no-fund
           npm run build
 
       - name: Typecheck
