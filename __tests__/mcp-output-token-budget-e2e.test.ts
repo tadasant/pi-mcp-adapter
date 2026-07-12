@@ -51,17 +51,26 @@ function modelText(result: { content: Array<{ type: string; text?: string }> }):
   return result.content.filter(block => block.type === "text").map(block => block.text ?? "").join("\n");
 }
 
-const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+// The guard reads these from the environment; a developer with them exported must not
+// get a red suite, and spills must not land in the real agent dir.
+const ENV_KEYS = ["PI_CODING_AGENT_DIR", "MCP_OUTPUT_MAX_TOKENS", "MCP_OUTPUT_GUARD"] as const;
+const originalEnv: Record<string, string | undefined> = {};
 let agentDir: string;
 
 beforeEach(() => {
+  for (const key of ENV_KEYS) {
+    originalEnv[key] = process.env[key];
+    delete process.env[key];
+  }
   agentDir = mkdtempSync(join(tmpdir(), "pi-mcp-e2e-agent-"));
   process.env.PI_CODING_AGENT_DIR = agentDir;
 });
 
 afterEach(async () => {
-  if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-  else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+  for (const key of ENV_KEYS) {
+    if (originalEnv[key] === undefined) delete process.env[key];
+    else process.env[key] = originalEnv[key];
+  }
   await Promise.all(managers.splice(0).map(manager => manager.closeAll()));
 });
 

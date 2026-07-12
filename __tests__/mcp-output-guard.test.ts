@@ -5,16 +5,24 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { guardMcpOutput, resolveMcpOutputGuardOptions, type McpResultSummary } from "../mcp-output-guard.ts";
 
-// Spilled output lands under the Pi agent dir; keep the suite out of the real one.
-const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+// Spilled output lands under the Pi agent dir; keep the suite out of the real one, and
+// out of the hands of a developer who has the guard's env overrides exported.
+const ENV_KEYS = ["PI_CODING_AGENT_DIR", "MCP_OUTPUT_MAX_TOKENS", "MCP_OUTPUT_GUARD"] as const;
+const originalEnv: Record<string, string | undefined> = {};
 
 beforeEach(() => {
+  for (const key of ENV_KEYS) {
+    originalEnv[key] = process.env[key];
+    delete process.env[key];
+  }
   process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-mcp-guard-agent-"));
 });
 
 afterEach(() => {
-  if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-  else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+  for (const key of ENV_KEYS) {
+    if (originalEnv[key] === undefined) delete process.env[key];
+    else process.env[key] = originalEnv[key];
+  }
 });
 
 describe("guardMcpOutput", () => {

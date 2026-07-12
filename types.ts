@@ -320,9 +320,16 @@ export interface ServerEntry {
 
 // Output guard tuning (settings.outputGuard object form)
 export interface McpOutputGuardSettings {
-  /** Maximum inline MCP text output bytes before truncation/spill-to-disk. Defaults to 51200 (50 KiB). */
+  /**
+   * Maximum inline MCP text output bytes before truncation/spill-to-disk. Defaults to
+   * 51200 (50 KiB). Also the backstop for scripts the token estimate undercounts.
+   * Unlike maxTokens, 0 is not a disable value — it falls back to the default.
+   */
   maxBytes?: number;
-  /** Maximum inline MCP text output lines before truncation/spill-to-disk. Defaults to 2000. */
+  /**
+   * Maximum inline MCP text output lines before truncation/spill-to-disk. Defaults to
+   * 2000. Unlike maxTokens, 0 is not a disable value — it falls back to the default.
+   */
   maxLines?: number;
   /**
    * Maximum estimated tokens (characters / 4) of inline MCP text output before

@@ -15,7 +15,13 @@ export const DEFAULT_MCP_DETAILS_MAX_BYTES = 16 * 1024;
  * that a handful of tool calls cannot crowd out the conversation.
  */
 export const DEFAULT_MCP_OUTPUT_MAX_TOKENS = 10_000;
-/** Characters per token — the standard rough approximation for English text. */
+/**
+ * Characters per token — the standard rough approximation, and an accurate one for
+ * the ASCII-dominated output (JSON, logs, code) MCP servers overwhelmingly return.
+ * It underestimates scripts that tokenize denser than Latin text (CJK is closer to
+ * one token per character); the byte cap is the backstop there, since those same
+ * scripts spend 3-4 UTF-8 bytes per character. See README "Output Guard".
+ */
 export const CHARS_PER_TOKEN = 4;
 /** Spill directory, relative to the Pi agent dir. */
 export const MCP_SPILL_DIR = "mcp-output";
@@ -23,6 +29,12 @@ export const MCP_SPILL_DIR = "mcp-output";
 export const DEFAULT_MAX_SPILL_FILES = 200;
 /** Total bytes retained in the spill directory before the oldest files are pruned. */
 export const DEFAULT_MAX_SPILL_BYTES = 128 * 1024 * 1024;
+/**
+ * Spill files younger than this are never pruned. A concurrent tool call may have
+ * just written one and handed its path to the model; evicting it would leave the
+ * model chasing a file that no longer exists.
+ */
+export const DEFAULT_SPILL_GRACE_MS = 60_000;
 
 const CONTENT_SUMMARY_LIMIT = 20;
 const KEY_PREVIEW_LIMIT = 20;
@@ -81,8 +93,13 @@ export interface McpOutputGuardOptions {
   /** Estimated-token budget for the text returned to the model. 0 disables the token cap. */
   maxTokens?: number;
   detailsMaxBytes?: number;
-  /** Spill files kept in the durable spill directory. Exposed for tests. */
+  /**
+   * Retention for the durable spill directory. Not settings-exposed: these bound
+   * disk use rather than model context, and the defaults suit any session.
+   */
   maxSpillFiles?: number;
+  maxSpillBytes?: number;
+  spillGraceMs?: number;
   /**
    * Raw MCP result to expose as details.mcpResult. Kept raw when its JSON
    * fits detailsMaxBytes (or when the guard is disabled); otherwise replaced
@@ -112,7 +129,7 @@ export function resolveMcpOutputGuardOptions(settings?: McpSettings): Pick<McpOu
     maxLines: positiveInt(tuning?.maxLines) ?? DEFAULT_MCP_OUTPUT_MAX_LINES,
     // Precedence: explicit settings value, then env override, then the default.
     maxTokens: countOrZero(tuning?.maxTokens)
-      ?? countOrZero(parseCount(process.env.MCP_OUTPUT_MAX_TOKENS))
+      ?? parseCount(process.env.MCP_OUTPUT_MAX_TOKENS)
       ?? DEFAULT_MCP_OUTPUT_MAX_TOKENS,
     detailsMaxBytes: positiveInt(tuning?.detailsMaxBytes) ?? DEFAULT_MCP_DETAILS_MAX_BYTES,
   };
@@ -141,7 +158,11 @@ export async function guardMcpOutput(
   const maxLines = options.maxLines ?? DEFAULT_MCP_OUTPUT_MAX_LINES;
   const maxTokens = options.maxTokens ?? DEFAULT_MCP_OUTPUT_MAX_TOKENS;
   const detailsMaxBytes = options.detailsMaxBytes ?? DEFAULT_MCP_DETAILS_MAX_BYTES;
-  const maxSpillFiles = options.maxSpillFiles ?? DEFAULT_MAX_SPILL_FILES;
+  const retention: SpillRetention = {
+    maxFiles: options.maxSpillFiles ?? DEFAULT_MAX_SPILL_FILES,
+    maxBytes: options.maxSpillBytes ?? DEFAULT_MAX_SPILL_BYTES,
+    graceMs: options.spillGraceMs ?? DEFAULT_SPILL_GRACE_MS,
+  };
   const prefix = options.prefix ?? "";
   const suffix = options.suffix ?? "";
 
@@ -173,12 +194,12 @@ export async function guardMcpOutput(
   const exceeded = exceededLimits(stats, maxBytes, maxLines, maxTokens);
 
   if (exceeded.length > 0) {
-    const { path: fullOutputPath, error: writeError } = await saveArtifact("output", composedOutput, maxSpillFiles);
+    const { path: fullOutputPath, error: writeError } = await saveArtifact("output", composedOutput, retention);
     const limits = { maxBytes, maxLines, maxTokens };
     const notice = chooseTruncationNotice(stats, exceeded, limits, fullOutputPath, writeError);
     const previewBudget = reserveBudget(maxBytes, maxLines, maxTokens, notice);
     const preview = truncateHead(composedOutput, previewBudget);
-    const finalText = `${preview}\n\n${notice}`;
+    const finalText = preview ? `${preview}\n\n${notice}` : notice;
     const finalStats = textStats(finalText);
 
     guardedContent = [{ type: "text" as const, text: finalText }, ...imageBlocks];
@@ -201,7 +222,7 @@ export async function guardMcpOutput(
 
   const mcpResult = options.rawMcpResult === undefined
     ? undefined
-    : await boundMcpResult(options.rawMcpResult, detailsMaxBytes, maxSpillFiles);
+    : await boundMcpResult(options.rawMcpResult, detailsMaxBytes, retention);
 
   return { content: guardedContent, outputGuard, mcpResult };
 }
@@ -404,15 +425,15 @@ function describeLimit(limit: ExceededLimit, limits: { maxBytes: number; maxLine
  * detailsMaxBytes; otherwise replace it with a compact summary and spill the
  * raw JSON to a file.
  */
-async function boundMcpResult(result: unknown, detailsMaxBytes: number, maxSpillFiles: number): Promise<unknown> {
+async function boundMcpResult(result: unknown, detailsMaxBytes: number, retention: SpillRetention): Promise<unknown> {
   const raw = safeStringify(result);
   const rawBytes = byteLength(raw);
   if (rawBytes <= detailsMaxBytes) return result;
-  return summarizeMcpResult(result, raw, rawBytes, maxSpillFiles);
+  return summarizeMcpResult(result, raw, rawBytes, retention);
 }
 
-async function summarizeMcpResult(result: unknown, raw: string, rawBytes: number, maxSpillFiles: number): Promise<McpResultSummary> {
-  const { path: fullResultPath, error: resultWriteError } = await saveArtifact("mcp-result", raw, maxSpillFiles);
+async function summarizeMcpResult(result: unknown, raw: string, rawBytes: number, retention: SpillRetention): Promise<McpResultSummary> {
+  const { path: fullResultPath, error: resultWriteError } = await saveArtifact("mcp-result", raw, retention);
 
   const record = asRecord(result);
   const content = Array.isArray(record?.content) ? record.content : [];
@@ -500,7 +521,7 @@ function truncateKey(key: string): string {
  * to it later; an unwritable agent dir falls back to an ephemeral temp dir so a
  * payload is never lost just because the agent dir is read-only.
  */
-async function saveArtifact(kind: string, text: string, maxSpillFiles: number): Promise<{ path?: string; error?: string }> {
+async function saveArtifact(kind: string, text: string, retention: SpillRetention): Promise<{ path?: string; error?: string }> {
   const name = artifactName(kind);
   const durableDir = getAgentPath(MCP_SPILL_DIR);
 
@@ -509,7 +530,7 @@ async function saveArtifact(kind: string, text: string, maxSpillFiles: number): 
     const path = resolveWithin(durableDir, name);
     // "wx" fails rather than following a pre-existing file or symlink at that path.
     await writeFile(path, text, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    await pruneSpillDir(durableDir, maxSpillFiles, path);
+    await pruneSpillDir(durableDir, retention, path);
     return { path };
   } catch (durableError) {
     try {
@@ -540,6 +561,12 @@ function resolveWithin(dir: string, name: string): string {
   return path;
 }
 
+interface SpillRetention {
+  maxFiles: number;
+  maxBytes: number;
+  graceMs: number;
+}
+
 interface SpillFile {
   path: string;
   mtimeMs: number;
@@ -549,13 +576,20 @@ interface SpillFile {
 /**
  * Keep the durable spill directory bounded — a long-lived agent dir would otherwise
  * accumulate spill files forever — by evicting the oldest files once the directory
- * exceeds either budget. `keepPath` is the file we just wrote and pointed the model
- * at; it is never evicted, even if it alone busts the byte budget. Best-effort: a
- * prune failure must not fail the tool call whose output we just saved.
+ * exceeds either budget.
+ *
+ * Files younger than the grace window are never evicted: this call and any tool call
+ * running concurrently have just handed those paths to the model, and a bound is not
+ * worth pointing the model at a file that no longer exists. The budgets are therefore
+ * enforced as soon as the newest spills age out, not instantly during a burst.
+ *
+ * Best-effort throughout: a prune failure must not fail the tool call whose output we
+ * just saved, so failures are logged at debug rather than thrown.
  */
-async function pruneSpillDir(dir: string, maxSpillFiles: number, keepPath: string): Promise<void> {
+async function pruneSpillDir(dir: string, retention: SpillRetention, keepPath: string): Promise<void> {
   try {
     const names = await readdir(dir);
+    const youngestPrunable = Date.now() - retention.graceMs;
 
     const entries = await Promise.all(names.map(async (name) => {
       const path = join(dir, name);
@@ -567,17 +601,18 @@ async function pruneSpillDir(dir: string, maxSpillFiles: number, keepPath: strin
       }
     }));
 
-    // Oldest first: those are the ones a long session no longer needs.
-    const files = entries.filter((entry): entry is SpillFile => entry !== undefined && entry.path !== keepPath)
+    const files = entries.filter((entry): entry is SpillFile => entry !== undefined);
+    // Oldest first: those are the ones a long session no longer needs. The file we just
+    // wrote is spared regardless of the grace window, which callers may set to zero.
+    const prunable = files.filter((file) => file.path !== keepPath && file.mtimeMs <= youngestPrunable)
       .sort((a, b) => a.mtimeMs - b.mtimeMs);
 
-    // The file we just wrote occupies one slot of the budget and is never evicted.
-    const fileBudget = maxSpillFiles > 0 ? Math.max(0, maxSpillFiles - 1) : Number.POSITIVE_INFINITY;
+    const fileBudget = retention.maxFiles > 0 ? retention.maxFiles : Number.POSITIVE_INFINITY;
     let count = files.length;
     let bytes = files.reduce((total, file) => total + file.bytes, 0);
 
-    for (const file of files) {
-      if (count <= fileBudget && bytes <= DEFAULT_MAX_SPILL_BYTES) break;
+    for (const file of prunable) {
+      if (count <= fileBudget && bytes <= retention.maxBytes) break;
       if (!(await removeSpillFile(file.path))) continue;
       count -= 1;
       bytes -= file.bytes;
@@ -624,6 +659,9 @@ function textStats(text: string): TextStats {
     tokens: Math.ceil(chars / CHARS_PER_TOKEN),
   };
 }
+
+// estimateTokens() is the same math over a fresh scan; textStats computes it inline
+// because it already has the character count in hand.
 
 function byteLength(text: string): number {
   return Buffer.byteLength(text, "utf8");

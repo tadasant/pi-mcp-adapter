@@ -1,5 +1,5 @@
 import { mkdtempSync, statSync, writeFileSync } from "node:fs";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -14,6 +14,7 @@ const ENV_KEYS = ["MCP_OUTPUT_MAX_TOKENS", "MCP_OUTPUT_GUARD", "PI_CODING_AGENT_
 const originalEnv: Record<string, string | undefined> = {};
 
 let agentDir: string;
+const scratchDirs: string[] = [];
 
 function textOf(guarded: { content: Array<{ type: string; text?: string }> }): string {
   return guarded.content.filter(block => block.type === "text").map(block => block.text ?? "").join("\n");
@@ -25,14 +26,16 @@ beforeEach(() => {
     delete process.env[key];
   }
   agentDir = mkdtempSync(join(tmpdir(), "pi-mcp-agent-"));
+  scratchDirs.push(agentDir);
   process.env.PI_CODING_AGENT_DIR = agentDir;
 });
 
-afterEach(() => {
+afterEach(async () => {
   for (const key of ENV_KEYS) {
     if (originalEnv[key] === undefined) delete process.env[key];
     else process.env[key] = originalEnv[key];
   }
+  await Promise.all(scratchDirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
 });
 
 describe("estimateTokens", () => {
@@ -125,7 +128,7 @@ describe("token budget enforcement", () => {
     expect(spilled.outputGuard).toMatchObject({ truncated: true });
   });
 
-  it("counts the token budget in characters, so multibyte text is not double-charged", async () => {
+  it("counts the token budget in characters, so multibyte text is not charged by byte length", async () => {
     // 40 CJK characters = 120 UTF-8 bytes, but exactly 10 estimated tokens.
     const text = "漢".repeat(40);
     const guarded = await guardMcpOutput([{ type: "text", text }], {
@@ -136,6 +139,18 @@ describe("token budget enforcement", () => {
 
     expect(guarded.outputGuard).toBeUndefined();
     expect(textOf(guarded)).toBe(text);
+  });
+
+  it("relies on the byte cap to bound scripts that chars/4 underestimates", async () => {
+    // chars/4 is calibrated on Latin text; real tokenizers spend far more on CJK
+    // (closer to one token per character). Those same characters cost 3 UTF-8 bytes,
+    // so the default byte cap — not the token cap — is what bounds them.
+    const text = "漢".repeat(30_000);
+    const guarded = await guardMcpOutput([{ type: "text", text }], {});
+
+    expect(estimateTokens(text)).toBeLessThan(DEFAULT_MCP_OUTPUT_MAX_TOKENS); // token cap alone would let it through
+    expect(guarded.outputGuard).toMatchObject({ truncated: true, exceeded: ["bytes"] });
+    expect(await readFile(guarded.outputGuard!.fullOutputPath!, "utf8")).toBe(text);
   });
 
   it("never splits a multibyte character when trimming the preview to the token budget", async () => {
@@ -294,26 +309,62 @@ describe("durable spill location", () => {
     expect(saved.sort()).toEqual([...texts].sort());
   });
 
-  it("bounds the spill directory so a long-lived agent dir cannot grow without limit", async () => {
+  it("bounds the spill directory by file count so a long-lived agent dir cannot grow without limit", async () => {
     const text = "g".repeat(5_000);
     const paths: string[] = [];
     for (let i = 0; i < 6; i++) {
-      const guarded = await guardMcpOutput([{ type: "text", text: `${i}\n${text}` }], { maxTokens: 50, maxSpillFiles: 3 });
+      // graceMs 0: without it, every spill is younger than the grace window and nothing prunes.
+      const guarded = await guardMcpOutput([{ type: "text", text: `${i}\n${text}` }], { maxTokens: 50, maxSpillFiles: 3, spillGraceMs: 0 });
       paths.push(guarded.outputGuard!.fullOutputPath!);
     }
 
-    const entries = await readdir(join(agentDir, "mcp-output"));
-    expect(entries.length).toBeLessThanOrEqual(3);
+    expect(await readdir(join(agentDir, "mcp-output"))).toHaveLength(3);
 
     // The pointer handed to the model for the most recent call must still resolve —
     // pruning evicts the oldest spills, never the one just written.
     expect(await readFile(paths[paths.length - 1], "utf8")).toContain("5\n");
   });
+
+  it("bounds the spill directory by total bytes", async () => {
+    const text = "h".repeat(20_000);
+    for (let i = 0; i < 6; i++) {
+      await guardMcpOutput([{ type: "text", text: `${i}\n${text}` }], {
+        maxTokens: 50,
+        maxSpillFiles: 1_000,
+        maxSpillBytes: 50_000,
+        spillGraceMs: 0,
+      });
+    }
+
+    const dir = join(agentDir, "mcp-output");
+    const entries = await readdir(dir);
+    const total = (await Promise.all(entries.map(name => stat(join(dir, name))))).reduce((sum, info) => sum + info.size, 0);
+    // The newest file is never evicted, so the budget is respected once it is excluded.
+    expect(total - 20_002).toBeLessThanOrEqual(50_000);
+    expect(entries.length).toBeLessThan(6);
+  });
+
+  it("never prunes a spill file a concurrent call just pointed the model at", async () => {
+    const text = "k".repeat(5_000);
+    // A tight file budget with concurrent calls: each call's prune sees the others' fresh
+    // files. The grace window is what keeps them from being evicted out from under them.
+    const guarded = await Promise.all(
+      Array.from({ length: 6 }, (_, i) =>
+        guardMcpOutput([{ type: "text", text: `${i}\n${text}` }], { maxTokens: 50, maxSpillFiles: 2 })),
+    );
+
+    const paths = guarded.map(g => g.outputGuard!.fullOutputPath!);
+    const saved = await Promise.all(paths.map(path => readFile(path, "utf8")));
+    expect(saved).toHaveLength(6);
+    expect(saved.every((content, i) => content.startsWith(`${i}\n`))).toBe(true);
+  });
 });
 
 describe("spill write failures", () => {
   it("falls back to inline truncation and reports the error when the payload cannot be saved", async () => {
-    const blocker = join(mkdtempSync(join(tmpdir(), "pi-mcp-blocked-")), "not-a-dir");
+    const blockerDir = mkdtempSync(join(tmpdir(), "pi-mcp-blocked-"));
+    scratchDirs.push(blockerDir);
+    const blocker = join(blockerDir, "not-a-dir");
     writeFileSync(blocker, "x");
     process.env.PI_CODING_AGENT_DIR = blocker;
     process.env.TMPDIR = blocker;
@@ -332,7 +383,9 @@ describe("spill write failures", () => {
   });
 
   it("keeps the payload recoverable in a temp file when only the agent dir is unwritable", async () => {
-    const blocker = join(mkdtempSync(join(tmpdir(), "pi-mcp-blocked-")), "not-a-dir");
+    const blockerDir = mkdtempSync(join(tmpdir(), "pi-mcp-blocked-"));
+    scratchDirs.push(blockerDir);
+    const blocker = join(blockerDir, "not-a-dir");
     writeFileSync(blocker, "x");
     process.env.PI_CODING_AGENT_DIR = blocker;
 

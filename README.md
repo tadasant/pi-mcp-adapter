@@ -205,8 +205,8 @@ Per-server `idleTimeout` and `requestTimeoutMs` override the global settings.
 Oversized MCP tool/resource results are guarded by default so a single huge response can't blow up the model context window or the session file:
 
 - Inline text output is capped by three limits that compose — **whichever trips first governs**:
-  - **~10,000 estimated tokens** (characters / 4). This is the context-window budget: roughly 5% of a 200k-token window, so no single tool call can crowd out the conversation.
-  - **50 KiB** of UTF-8 bytes.
+  - **~10,000 estimated tokens** (characters / 4). This is the context-window budget: roughly 5% of a 200k-token window, so no single tool call can crowd out the conversation. `chars / 4` is the standard estimate and is accurate for the ASCII-dominated output (JSON, logs, code) that MCP servers overwhelmingly return; it *underestimates* scripts that tokenize denser than Latin text — CJK is closer to one token per character — which is what the byte cap is for.
+  - **50 KiB** of UTF-8 bytes. This is the backstop for the scripts above: they spend 3–4 UTF-8 bytes per character, so they hit the byte cap long before the token cap. Lower `maxBytes` if your servers return a lot of non-Latin text and you want a tighter real-token bound.
   - **2,000 lines** (matching Pi's built-in `bash` guard).
 - Larger output is truncated to a head preview, and the full text is saved to `<Pi agent dir>/mcp-output/` (`~/.pi/agent/mcp-output/` by default, or `$PI_CODING_AGENT_DIR/mcp-output/`). The model gets a size summary (characters / estimated tokens / lines) plus the saved path, so it can `read` the file with `offset`/`limit`, `grep` it, or run a structured query over it instead of pulling the blob back inline.
 - **Image content blocks pass through unchanged** — only text output is guarded. Images are delivered to the provider as native image content.
@@ -236,7 +236,7 @@ Set `"outputGuard": false` — or the env kill switch `MCP_OUTPUT_GUARD=0` — t
 A few details worth knowing:
 
 - The pointer notice is the floor of what a truncated result costs: a cap too small to fit the full notice gets a one-line pointer instead of a preview, but the guard can never spend zero tokens telling the model where the payload went.
-- Spill files are created with mode `0600` in a `0700` directory. The directory is trimmed to its 200 most recent files and 128 MiB; the file a result just pointed at is never pruned. Spilled MCP output may contain sensitive data.
+- Spill files are created with mode `0600` in a `0700` directory. The directory is trimmed to its 200 most recent files and 128 MiB. Files written in the last minute are never pruned, so a spill that a concurrent tool call just pointed the model at cannot be deleted out from under it. Spilled MCP output may contain sensitive data.
 - If the agent dir cannot be written, the adapter falls back to a temp file; if that also fails, it returns the head preview inline along with the write error rather than dropping the result.
 
 ### MCP Elicitation
